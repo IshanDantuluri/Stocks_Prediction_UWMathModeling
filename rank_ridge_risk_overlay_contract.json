@@ -1,0 +1,78 @@
+{
+  "format_version": 1,
+  "model": "walk-forward quant rank plus transparent risk-factor rank",
+  "risk_features": [
+    "volatility_20d__lag1",
+    "volatility_20d__lag5",
+    "volatility_20d__lag20",
+    "intraday_range__lag1",
+    "intraday_range__lag5",
+    "intraday_range__lag20"
+  ],
+  "risk_score": "equal-weight daily percentile ranks",
+  "selected_risk_weight": 0.75,
+  "weight_candidates": [
+    {
+      "risk_weight": 0.0,
+      "validation_mean_daily_ic": 0.021191892719863215,
+      "validation_sessions": 502
+    },
+    {
+      "risk_weight": 0.1,
+      "validation_mean_daily_ic": 0.022828821413531864,
+      "validation_sessions": 502
+    },
+    {
+      "risk_weight": 0.25,
+      "validation_mean_daily_ic": 0.025706957472511657,
+      "validation_sessions": 502
+    },
+    {
+      "risk_weight": 0.5,
+      "validation_mean_daily_ic": 0.031822468496979346,
+      "validation_sessions": 502
+    },
+    {
+      "risk_weight": 0.75,
+      "validation_mean_daily_ic": 0.03485841731845573,
+      "validation_sessions": 502
+    },
+    {
+      "risk_weight": 1.0,
+      "validation_mean_daily_ic": 0.03091941548722983,
+      "validation_sessions": 502
+    }
+  ],
+  "selection_split": "2023-01-01 through 2024-12-31 only",
+  "walkforward_training_window_years": 8,
+  "summaries": [
+    {
+      "split": "validation",
+      "base_ic": 0.021194536245624503,
+      "overlay_ic": 0.03545318275174731,
+      "paired_ic_lift": 0.013663881072831226,
+      "paired_hac_p": 0.3566043695931439,
+      "overlay_spread": 0.008522652809881999,
+      "sessions": 498
+    },
+    {
+      "split": "test_2025",
+      "base_ic": 0.027722218867068524,
+      "overlay_ic": 0.0456687792028372,
+      "paired_ic_lift": 0.01779799719078831,
+      "paired_hac_p": 0.27587050536957053,
+      "overlay_spread": 0.009441618819174186,
+      "sessions": 248
+    },
+    {
+      "split": "forward_2026",
+      "base_ic": 0.018299701037155783,
+      "overlay_ic": 0.012171922960807081,
+      "paired_ic_lift": -0.006127778076348689,
+      "paired_hac_p": 0.6791484501231837,
+      "overlay_spread": 0.009787071575660155,
+      "sessions": 134
+    }
+  ],
+  "status": "2025 and 2026 are report-only and were not used for weight selection"
+}

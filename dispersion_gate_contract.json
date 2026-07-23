@@ -1,0 +1,111 @@
+{
+  "candidates": [
+    {
+      "threshold": 0.0,
+      "trade_fraction": 0.8804780876494024,
+      "validation_calendar_gross": 0.003219260344592414,
+      "validation_calendar_net": -0.00030265200600519644,
+      "worst_validation_year_net": -0.0003208011833952725
+    },
+    {
+      "threshold": 0.25,
+      "trade_fraction": 0.7669322709163346,
+      "validation_calendar_gross": 0.003039131738138207,
+      "validation_calendar_net": -2.859734552713253e-05,
+      "worst_validation_year_net": -0.0006376721861990101
+    },
+    {
+      "threshold": 0.5,
+      "trade_fraction": 0.599601593625498,
+      "validation_calendar_gross": 0.0023768483394867924,
+      "validation_calendar_net": -2.1558035015199998e-05,
+      "worst_validation_year_net": -0.0002786832606065314
+    },
+    {
+      "threshold": 0.6,
+      "trade_fraction": 0.5159362549800797,
+      "validation_calendar_gross": 0.0021683501684252333,
+      "validation_calendar_net": 0.00010460514850491402,
+      "worst_validation_year_net": -0.0003129037598025227
+    },
+    {
+      "threshold": 0.7,
+      "trade_fraction": 0.41434262948207173,
+      "validation_calendar_gross": 0.0016902255787347095,
+      "validation_calendar_net": 3.285506080642239e-05,
+      "worst_validation_year_net": -0.0005418040369098413
+    },
+    {
+      "threshold": 0.75,
+      "trade_fraction": 0.3665338645418327,
+      "validation_calendar_gross": 0.0013277477238307447,
+      "validation_calendar_net": -0.00013838773433658624,
+      "worst_validation_year_net": -0.0006746328596298395
+    },
+    {
+      "threshold": 0.8,
+      "trade_fraction": 0.2968127490039841,
+      "validation_calendar_gross": 0.0008027877399105637,
+      "validation_calendar_net": -0.0003844632561053726,
+      "worst_validation_year_net": -0.0007008125257524601
+    },
+    {
+      "threshold": 0.9,
+      "trade_fraction": 0.18725099601593626,
+      "validation_calendar_gross": 0.0008602277371813906,
+      "validation_calendar_net": 0.00011122375311764552,
+      "worst_validation_year_net": 3.9072899750425255e-05
+    }
+  ],
+  "cost_bps_per_side": 10.0,
+  "format_version": 1,
+  "gate_feature": "daily prediction p90 minus p10",
+  "lookback_sessions": 252,
+  "minimum_history_sessions": 60,
+  "prediction_source": "rank_ridge_combined_sec_predictions.csv",
+  "selected_threshold": 0.6,
+  "selection_rule": "highest 2023-2024 mean net calendar contribution; choose the least restrictive threshold within the configured tolerance",
+  "selection_tolerance_bps": 0.5,
+  "validation_years": [
+    2023,
+    2024
+  ],
+  "years": {
+    "2023": {
+      "calendar_gross_contribution": 0.0013190962401974772,
+      "calendar_net_contribution": -0.0003129037598025227,
+      "conditional_gross_spread": 0.0032330790200918555,
+      "conditional_spread_hac_p": 0.23433374756554357,
+      "sessions": 250,
+      "trade_fraction": 0.408,
+      "traded_sessions": 102
+    },
+    "2024": {
+      "calendar_gross_contribution": 0.003010863986111499,
+      "calendar_net_contribution": 0.0005188004940480062,
+      "conditional_gross_spread": 0.004832724359873234,
+      "conditional_spread_hac_p": 0.25721999911997423,
+      "sessions": 252,
+      "trade_fraction": 0.623015873015873,
+      "traded_sessions": 157
+    },
+    "2025": {
+      "calendar_gross_contribution": 0.0028485648869225485,
+      "calendar_net_contribution": 0.0008005648869225479,
+      "conditional_gross_spread": 0.0055636032947706015,
+      "conditional_spread_hac_p": 0.2712906915962745,
+      "sessions": 250,
+      "trade_fraction": 0.512,
+      "traded_sessions": 128
+    },
+    "2026": {
+      "calendar_gross_contribution": 0.004118367960663859,
+      "calendar_net_contribution": 0.0028944873636489333,
+      "conditional_gross_spread": 0.013460031871437982,
+      "conditional_spread_hac_p": 0.21210443166018333,
+      "sessions": 134,
+      "trade_fraction": 0.30597014925373134,
+      "traded_sessions": 41
+    }
+  }
+}
