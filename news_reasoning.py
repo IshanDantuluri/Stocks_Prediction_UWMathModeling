@@ -297,6 +297,47 @@ def _hit_payload(hit: SearchHit) -> dict[str, Any]:
     }
 
 
+def _hit_from_payload(value: dict[str, Any]) -> SearchHit:
+    return SearchHit(
+        article_id=int(value["article_id"]),
+        score=float(value["score"]),
+        chunk_id=int(value["chunk_id"]),
+        title=value.get("title"),
+        domain=value.get("domain"),
+        first_event_date=value.get("date"),
+        passage=value.get("passage"),
+    )
+
+
+def reusable_retrieval(
+    db: sqlite3.Connection,
+    event: Event,
+    entity: Entity,
+    model_id: str,
+    source_prompt_version: str,
+) -> tuple[list[SearchHit], list[SearchHit]] | None:
+    """Load an explicitly requested prior retrieval context for the same input."""
+    row = db.execute(
+        """SELECT exclusive_cutoff,continuation_json,analogues_json
+           FROM retrieval_contexts
+           WHERE event_id=? AND scope=? AND entity_id=? AND model_id=?
+             AND prompt_version=?""",
+        (
+            event.event_id,
+            entity.scope,
+            entity.entity_id,
+            model_id,
+            source_prompt_version,
+        ),
+    ).fetchone()
+    if row is None or row[0] != event.event_date.isoformat():
+        return None
+    return (
+        [_hit_from_payload(value) for value in json.loads(row[1])],
+        [_hit_from_payload(value) for value in json.loads(row[2])],
+    )
+
+
 class HistoricalRetriever:
     """Automatic local retrieval, not an LLM tool-call loop."""
 
@@ -317,11 +358,18 @@ class HistoricalRetriever:
 
     def _get_model(self):
         if self._model is None:
-            self._model = load_query_model(self.index.manifest["model_name"])
+            self._model = load_query_model(
+                self.index.manifest["model_name"],
+                self.index.manifest.get("model_revision"),
+            )
         return self._model
 
     def retrieve(
-        self, event: Event, entity: Entity
+        self,
+        event: Event,
+        entity: Entity,
+        *,
+        exclude_current_articles: bool = True,
     ) -> tuple[list[SearchHit], list[SearchHit]]:
         base = event.retrieval_query or f"{event.title}. {event.summary}"
         continuation_query = f"{entity.entity_id} update continuation {base}"
@@ -345,7 +393,7 @@ class HistoricalRetriever:
             top_articles=self.analogue_count + len(event.article_ids),
             before=event.event_date,
         )
-        excluded = set(event.article_ids)
+        excluded = set(event.article_ids) if exclude_current_articles else set()
         continuation = [
             hit for hit in continuation if hit.article_id not in excluded
         ][: self.continuation_count]
@@ -358,7 +406,101 @@ class HistoricalRetriever:
         )
 
 
-def _upsert_event(db: sqlite3.Connection, event: Event) -> None:
+def _merge_retrieval_hits(
+    groups: Sequence[Sequence[SearchHit]],
+    limit: int,
+) -> list[SearchHit]:
+    """Merge comparable hybrid-search results while removing repeated passages."""
+    candidates = sorted(
+        (hit for group in groups for hit in group),
+        key=lambda hit: (hit.score, hit.semantic_score or float("-inf")),
+        reverse=True,
+    )
+    selected = []
+    seen = set()
+    for hit in candidates:
+        identity = (
+            hit.domain or "",
+            hit.title or "",
+            hit.first_event_date or "",
+            (hit.passage or "")[:500],
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        selected.append(hit)
+        if len(selected) == limit:
+            break
+    return selected
+
+
+class MultiHistoricalRetriever:
+    """Search multiple compatible archives with one shared embedding model."""
+
+    def __init__(
+        self,
+        sources: Sequence[tuple[Path, Path]],
+        instruction: str = DEFAULT_INSTRUCTION,
+        continuation_count: int = 3,
+        analogue_count: int = 3,
+    ):
+        if not sources:
+            raise ValueError("at least one retrieval source is required")
+        self.continuation_count = continuation_count
+        self.analogue_count = analogue_count
+        self.retrievers = [
+            HistoricalRetriever(
+                archive,
+                index,
+                instruction,
+                continuation_count,
+                analogue_count,
+            )
+            for archive, index in sources
+        ]
+        manifests = [retriever.index.manifest for retriever in self.retrievers]
+        compatibility = {
+            (manifest["model_name"], int(manifest["dimension"]))
+            for manifest in manifests
+        }
+        if len(compatibility) != 1:
+            raise ValueError(
+                "all retrieval sources must use the same embedding model and dimension"
+            )
+
+    def retrieve(
+        self,
+        event: Event,
+        entity: Entity,
+    ) -> tuple[list[SearchHit], list[SearchHit]]:
+        continuations = []
+        analogues = []
+        shared_model = None
+        for source_number, retriever in enumerate(self.retrievers):
+            if shared_model is not None:
+                retriever._model = shared_model
+            continuation, analogue = retriever.retrieve(
+                event,
+                entity,
+                exclude_current_articles=(source_number == 0),
+            )
+            shared_model = retriever._model
+            continuations.append(continuation)
+            analogues.append(analogue)
+        return (
+            _merge_retrieval_hits(continuations, self.continuation_count),
+            _merge_retrieval_hits(analogues, self.analogue_count),
+        )
+
+
+def _upsert_event(db: sqlite3.Connection, event: Event) -> Event:
+    """Persist an event once and return its immutable stored representation.
+
+    A later linker pass may improve its prose summary while adding candidates.
+    Existing reasoning states must not be silently replayed from that changed
+    summary, so new entity links reuse the originally stored event.  Changes to
+    chronology or article provenance remain hard errors.
+    """
     payload = (
         event.event_id,
         event.event_date.isoformat(),
@@ -373,12 +515,40 @@ def _upsert_event(db: sqlite3.Connection, event: Event) -> None:
                   retrieval_query FROM events WHERE event_id=?""",
         (event.event_id,),
     ).fetchone()
-    if existing is not None and existing != payload[1:]:
-        raise ValueError(f"event_id {event.event_id!r} already has different content")
+    if existing is not None:
+        if existing == payload[1:]:
+            return event
+        (
+            stored_date,
+            stored_title,
+            stored_summary,
+            stored_articles,
+            stored_domains,
+            stored_query,
+        ) = existing
+        if (
+            stored_date != event.event_date.isoformat()
+            or tuple(json.loads(stored_articles)) != tuple(event.article_ids)
+            or tuple(json.loads(stored_domains)) != tuple(event.source_domains)
+        ):
+            raise ValueError(
+                f"event_id {event.event_id!r} already has different chronology "
+                "or article provenance"
+            )
+        return Event(
+            event.event_id,
+            date.fromisoformat(stored_date),
+            stored_title,
+            stored_summary,
+            tuple(json.loads(stored_articles)),
+            tuple(json.loads(stored_domains)),
+            stored_query,
+        )
     db.execute(
         """INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?,?)""",
         payload,
     )
+    return event
 
 
 def process_event(
@@ -387,10 +557,10 @@ def process_event(
     entity: Entity,
     provider: ReasoningProvider,
     retriever: HistoricalRetriever | None,
+    reuse_retrieval_prompt: str | None = None,
 ) -> bool:
     """Process one entity-event; return False if that exact run is cached."""
     initialize_memory(db)
-    _upsert_event(db, event)
     identity = (
         event.event_id,
         entity.scope,
@@ -405,6 +575,7 @@ def process_event(
     ).fetchone():
         db.commit()
         return False
+    event = _upsert_event(db, event)
     previous = read_state(
         db, entity, provider.model_id, provider.prompt_version
     )
@@ -416,9 +587,19 @@ def process_event(
     # request is in flight. That would serialize workers behind the database lock
     # and can look like a hung process when one HTTP request is slow.
     db.commit()
-    continuation, analogues = (
-        retriever.retrieve(event, entity) if retriever else ([], [])
+    reused = (
+        reusable_retrieval(
+            db, event, entity, provider.model_id, reuse_retrieval_prompt
+        )
+        if reuse_retrieval_prompt
+        else None
     )
+    if reused is not None:
+        continuation, analogues = reused
+    else:
+        continuation, analogues = (
+            retriever.retrieve(event, entity) if retriever else ([], [])
+        )
     result = provider.analyze(
         AnalysisRequest(
             event, entity, previous, tuple(continuation), tuple(analogues)

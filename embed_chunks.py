@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import sqlite3
@@ -97,10 +98,11 @@ def canonical_chunk_query(limit: int | None = None) -> tuple[str, tuple]:
 
 
 def encode_with_backoff(model, rows: list[tuple], batch_size: int, device: str):
-    """Encode a prefix, reducing the batch after a CUDA out-of-memory error."""
+    """Encode a prefix, reducing the batch after a GPU out-of-memory error."""
     import torch
 
     size = min(batch_size, len(rows))
+    retried_single_after_clear = False
     while True:
         try:
             vectors = model.encode(
@@ -112,11 +114,27 @@ def encode_with_backoff(model, rows: list[tuple], batch_size: int, device: str):
             )
             return rows[:size], vectors, size
         except RuntimeError as error:
-            if "out of memory" not in str(error).lower() or size == 1:
+            if "out of memory" not in str(error).lower():
                 raise
-            size = max(1, size // 2)
             if device == "cuda":
                 torch.cuda.empty_cache()
+            elif device == "mps":
+                # MPS can retain private-pool allocations after a failed
+                # variable-length attention batch.  Without explicitly
+                # releasing the cache, every smaller retry can fail even
+                # though the model itself occupies little memory.
+                gc.collect()
+                torch.mps.empty_cache()
+            if size == 1:
+                if retried_single_after_clear:
+                    raise
+                retried_single_after_clear = True
+                print(
+                    "GPU out of memory at batch size 1; cache cleared, retrying once",
+                    flush=True,
+                )
+                continue
+            size = max(1, size // 2)
             print(f"GPU out of memory; retrying with batch size {size}", flush=True)
 
 
@@ -125,13 +143,26 @@ def main() -> None:
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--model-revision",
+        help="Hugging Face model commit/tag to load for reproducible embeddings",
+    )
     parser.add_argument("--chunking-version", default=DEFAULT_CHUNKING_VERSION)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--limit", type=int, help="maximum canonical chunks to consider")
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"), default="cuda")
+    parser.add_argument(
+        "--cache-clear-every",
+        type=int,
+        default=50,
+        help=(
+            "on MPS, release cached private-pool allocations after this many "
+            "successful batches; use 0 to disable"
+        ),
+    )
     args = parser.parse_args()
-    if args.batch_size <= 0:
-        parser.error("--batch-size must be positive")
+    if args.batch_size <= 0 or args.cache_clear_every < 0:
+        parser.error("--batch-size must be positive and --cache-clear-every nonnegative")
 
     import torch
     from sentence_transformers import SentenceTransformer
@@ -139,7 +170,10 @@ def main() -> None:
     dtype = torch.float16 if args.device in ("cuda", "mps") else torch.float32
     print(f"Loading {args.model} on {args.device}...", flush=True)
     model = SentenceTransformer(
-        args.model, device=args.device, model_kwargs={"torch_dtype": dtype}
+        args.model,
+        device=args.device,
+        revision=args.model_revision,
+        model_kwargs={"torch_dtype": dtype},
     )
     model.max_seq_length = 600
     dimension = int(model.get_sentence_embedding_dimension())
@@ -176,7 +210,7 @@ def main() -> None:
 
         pending: deque[tuple] = deque()
         cursor = source.execute(query, params)
-        examined = written = 0
+        examined = written = successful_batches = 0
         current_batch = args.batch_size
         started = time.monotonic()
         exhausted = False
@@ -209,6 +243,17 @@ def main() -> None:
             for _ in encoded_rows:
                 pending.popleft()
             written += len(encoded_rows)
+            successful_batches += 1
+            if (
+                args.device == "mps"
+                and args.cache_clear_every
+                and successful_batches % args.cache_clear_every == 0
+            ):
+                # The encoded vectors are already NumPy arrays and committed,
+                # so no live GPU result is needed past this point.
+                del vectors
+                gc.collect()
+                torch.mps.empty_cache()
 
             elapsed = max(time.monotonic() - started, 0.001)
             done = min(total, len(completed) + written)

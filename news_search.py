@@ -288,7 +288,10 @@ class ExactNewsIndex:
             if token not in STOPWORDS and token not in seen:
                 seen.add(token)
                 tokens.append(token.replace('"', '""'))
-        return " OR ".join(f'"{token}"' for token in tokens)
+        # The semantic branch supplies broad recall. Requiring every lexical
+        # term keeps FTS precise and avoids ranking millions of chunks for
+        # common finance words in large corpora.
+        return " AND ".join(f'"{token}"' for token in tokens)
 
     def _keyword_chunks(
         self, query: str, before: date | None, candidate_chunks: int
@@ -416,24 +419,70 @@ def hydrate_hits(archive_path: Path, hits: list[SearchHit]) -> list[SearchHit]:
     uri = f"file:{archive_path.resolve()}?mode=ro"
     with sqlite3.connect(uri, uri=True) as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(articles)")}
-        date_expression = (
-            "COALESCE(root.effective_date,MIN(e.date))"
-            if "effective_date" in columns
-            else "MIN(e.date)"
-        )
-        articles = {
+        effective_column = ",effective_date" if "effective_date" in columns else ""
+        roots = {
             row[0]: row[1:]
             for row in db.execute(
-                f"""SELECT root.id,root.title,root.domain,root.source_url,root.published_at,
-                            {date_expression},GROUP_CONCAT(DISTINCT e.event_category)
-                     FROM articles root
-                     LEFT JOIN articles copies
-                       ON COALESCE(copies.canonical_article_id,copies.id)=root.id
-                     LEFT JOIN events e ON e.article_id=copies.id
-                     WHERE root.id IN ({article_marks}) GROUP BY root.id""",
+                f"""SELECT id,title,domain,source_url,published_at{effective_column}
+                    FROM articles WHERE id IN ({article_marks})""",
                 article_ids,
             )
         }
+        # When the cleaner has already materialized effective dates, root
+        # metadata is sufficient for hydration. Scanning multi-gigabyte article
+        # tables for duplicate rows made a three-hit SEC result take ~16s.
+        have_all_effective_dates = (
+            "effective_date" in columns
+            and all(metadata[-1] for metadata in roots.values())
+        )
+        if have_all_effective_dates:
+            copy_rows = [(root_id, root_id) for root_id in roots]
+        else:
+            # Legacy archives can still recover dates/categories from copies.
+            copy_rows = db.execute(
+                f"""SELECT id,COALESCE(canonical_article_id,id)
+                    FROM articles
+                    WHERE id IN ({article_marks})
+                       OR canonical_article_id IN ({article_marks})""",
+                (*article_ids, *article_ids),
+            ).fetchall()
+        copy_ids = [row[0] for row in copy_rows]
+        root_by_copy = {row[0]: row[1] for row in copy_rows}
+        dates_by_root: dict[int, list[str]] = {}
+        categories_by_root: dict[int, set[str]] = {}
+        if copy_ids:
+            copy_marks = ",".join("?" for _ in copy_ids)
+            for copy_id, first_date, categories in db.execute(
+                f"""SELECT article_id,MIN(date),
+                           GROUP_CONCAT(DISTINCT event_category)
+                    FROM events WHERE article_id IN ({copy_marks})
+                    GROUP BY article_id""",
+                copy_ids,
+            ):
+                root_id = root_by_copy[copy_id]
+                if first_date:
+                    dates_by_root.setdefault(root_id, []).append(first_date)
+                if categories:
+                    categories_by_root.setdefault(root_id, set()).update(
+                        value for value in categories.split(",") if value
+                    )
+        articles = {}
+        for root_id, metadata in roots.items():
+            title, domain, source_url, published_at, *effective = metadata
+            first_date = (
+                effective[0]
+                if effective and effective[0]
+                else min(dates_by_root.get(root_id, []), default=None)
+            )
+            categories = ",".join(sorted(categories_by_root.get(root_id, ()))) or None
+            articles[root_id] = (
+                title,
+                domain,
+                source_url,
+                published_at,
+                first_date,
+                categories,
+            )
         passages = dict(
             db.execute(
                 f"SELECT id,body_text FROM article_chunks WHERE id IN ({chunk_marks})",
@@ -461,14 +510,22 @@ def encode_query_with_model(model, query: str, instruction: str) -> np.ndarray:
     return model.encode([detailed], normalize_embeddings=True, convert_to_numpy=True)[0]
 
 
-def load_query_model(model_name: str):
+def load_query_model(model_name: str, model_revision: str | None = None):
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(model_name)
+    kwargs = {"revision": model_revision} if model_revision else {}
+    return SentenceTransformer(model_name, **kwargs)
 
 
-def encode_query(model_name: str, query: str, instruction: str) -> np.ndarray:
-    return encode_query_with_model(load_query_model(model_name), query, instruction)
+def encode_query(
+    model_name: str,
+    query: str,
+    instruction: str,
+    model_revision: str | None = None,
+) -> np.ndarray:
+    return encode_query_with_model(
+        load_query_model(model_name, model_revision), query, instruction
+    )
 
 
 def run_search(
@@ -579,7 +636,10 @@ Any other line is treated as a search query.""")
         try:
             if mode != "keyword" and model is None:
                 print(f"Loading {index.manifest['model_name']} once for this session...", flush=True)
-                model = load_query_model(index.manifest["model_name"])
+                model = load_query_model(
+                    index.manifest["model_name"],
+                    index.manifest.get("model_revision"),
+                )
             hits = run_search(
                 index, archive, value, mode, top, before, instruction, model
             )
@@ -636,7 +696,14 @@ def main() -> None:
         return
 
     index = ExactNewsIndex(args.index)
-    model = None if args.mode == "keyword" else load_query_model(index.manifest["model_name"])
+    model = (
+        None
+        if args.mode == "keyword"
+        else load_query_model(
+            index.manifest["model_name"],
+            index.manifest.get("model_revision"),
+        )
+    )
     hits = run_search(
         index, args.archive, args.query, args.mode, args.top,
         args.before, args.instruction, model,

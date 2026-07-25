@@ -14,9 +14,11 @@ from news_reasoning import (
     aggregate_assessments,
     export_trading_features,
     initialize_memory,
+    _merge_retrieval_hits,
     process_event,
     read_state,
 )
+from news_search import SearchHit
 
 
 class FakeProvider:
@@ -47,7 +49,62 @@ class FakeProvider:
         )
 
 
+class FakeRetriever:
+    def __init__(self):
+        self.calls = 0
+
+    def retrieve(self, _event, _entity):
+        self.calls += 1
+        return (
+            [
+                SearchHit(
+                    article_id=1,
+                    score=0.9,
+                    chunk_id=10,
+                    title="Prior event",
+                    first_event_date="2023-01-01",
+                    passage="Prior evidence.",
+                )
+            ],
+            [],
+        )
+
+
 class NewsReasoningTests(unittest.TestCase):
+    def test_multi_source_merge_ranks_and_deduplicates_passages(self):
+        duplicate_low = SearchHit(
+            article_id=1,
+            score=0.2,
+            chunk_id=1,
+            domain="sec.gov",
+            title="Same disclosure",
+            first_event_date="2024-01-01",
+            passage="Identical evidence.",
+        )
+        duplicate_high = SearchHit(
+            article_id=99,
+            score=0.9,
+            chunk_id=99,
+            domain="sec.gov",
+            title="Same disclosure",
+            first_event_date="2024-01-01",
+            passage="Identical evidence.",
+        )
+        news_hit = SearchHit(
+            article_id=2,
+            score=0.8,
+            chunk_id=2,
+            domain="reuters.com",
+            title="Related report",
+            first_event_date="2023-12-20",
+            passage="Independent context.",
+        )
+        merged = _merge_retrieval_hits(
+            [[duplicate_low, news_hit], [duplicate_high]],
+            limit=2,
+        )
+        self.assertEqual([hit.score for hit in merged], [0.9, 0.8])
+
     def test_assessment_validation(self):
         with self.assertRaises(ValueError):
             EventAssessment(1.1, 0.5, 0.5, 0.5)
@@ -141,6 +198,84 @@ class NewsReasoningTests(unittest.TestCase):
                     provider,
                     None,
                 )
+
+    def test_new_entity_reuses_immutable_stored_event_after_relink(self):
+        provider = FakeProvider()
+        original = Event(
+            "event-1",
+            date(2024, 1, 3),
+            "Original title",
+            "Original summary.",
+            (10, 11),
+            ("a.com",),
+        )
+        relinked = Event(
+            "event-1",
+            date(2024, 1, 3),
+            "Improved title",
+            "Improved linker summary.",
+            (10, 11),
+            ("a.com",),
+        )
+        with sqlite3.connect(":memory:") as db:
+            initialize_memory(db)
+            process_event(
+                db, original, Entity("ticker", "NVDA"), provider, None
+            )
+            process_event(
+                db, relinked, Entity("ticker", "AMD"), provider, None
+            )
+            self.assertEqual(provider.requests[-1].event.summary, "Original summary.")
+            with self.assertRaisesRegex(ValueError, "article provenance"):
+                process_event(
+                    db,
+                    Event(
+                        "event-1",
+                        date(2024, 1, 3),
+                        "Original title",
+                        "Original summary.",
+                        (99,),
+                        ("a.com",),
+                    ),
+                    Entity("ticker", "AAPL"),
+                    provider,
+                    None,
+                )
+
+    def test_explicit_cross_version_retrieval_reuse_avoids_new_search(self):
+        event = Event(
+            "event-1",
+            date(2024, 1, 3),
+            "Event",
+            "Summary",
+            (10,),
+            ("a.com",),
+        )
+        entity = Entity("ticker", "NVDA")
+        first_provider = FakeProvider()
+        first_retriever = FakeRetriever()
+        second_provider = FakeProvider()
+        second_provider.prompt_version = "test-v2"
+        second_retriever = FakeRetriever()
+        with sqlite3.connect(":memory:") as db:
+            initialize_memory(db)
+            process_event(
+                db, event, entity, first_provider, first_retriever
+            )
+            process_event(
+                db,
+                event,
+                entity,
+                second_provider,
+                second_retriever,
+                reuse_retrieval_prompt="test-v1",
+            )
+        self.assertEqual(first_retriever.calls, 1)
+        self.assertEqual(second_retriever.calls, 0)
+        self.assertEqual(
+            second_provider.requests[0].continuation_hits[0].passage,
+            "Prior evidence.",
+        )
 
     def test_news_is_available_only_at_first_strictly_later_session(self):
         provider = FakeProvider()

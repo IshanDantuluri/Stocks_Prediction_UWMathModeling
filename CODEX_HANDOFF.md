@@ -566,3 +566,237 @@ The conclusion is not that sector behavior is identical. It is that the
 available OHLCV+SEC inputs do not support stable independently estimated
 sector corrections. More specialization would increase variance and tuning
 degrees of freedom without a validation basis.
+
+## SEC full-text overnight continuation started 2026-07-24
+
+The final 2015–2019 SEC fetch is running as PID 32990:
+
+```bash
+python3 sec_text_archive.py sync \
+  --since 2015-01-01 \
+  --until 2019-12-31 \
+  --limit-filings 40000 \
+  --max-documents 70000 \
+  --requests-per-second 9 \
+  --download-workers 48 \
+  --workers 8 \
+  --retry-failed
+```
+
+`continue_sec_pipeline.py` is attached in a persistent Codex terminal and
+waiting for that PID. Its log is `sec_pipeline_overnight.log`. It will:
+
+1. repair/re-extract old oversized SEC artifacts and enforce the 50,000
+   character cap;
+2. clean the full archive with 8 processes;
+3. build paragraph-aware chunks;
+4. embed them into `sec_embeddings.sqlite3` on MPS with batch size 8 and
+   periodic MPS cache release;
+5. build `sec_search_index`;
+6. create accession-level events and deterministic issuer links in
+   `sec_events.sqlite3`;
+7. run a bounded 100-link DeepSeek smoke pass into
+   `sec_reasoning.sqlite3`, retrieving from both SEC filings and historical
+   news with one shared Qwen model; and
+8. export `sec_trading_features_sample.csv` on the next-market-open calendar.
+
+The runner stops rather than advancing after a failed stage and refuses a new
+stage below 10 GiB free. Every expensive stage is resumable.
+
+New `sec_events.py` groups usable primary and Exhibit 99 documents by SEC
+accession, uses `sec_filing_tickers` as a deterministic direct issuer link
+(`sec-metadata-v1` / `sec-issuer-v1`), and supplies up to 16,000 characters of
+cleaned current-filing evidence directly to the chronological reasoner. This
+avoids a redundant DeepSeek linker call for the known issuer.
+
+`deepseek_reasoner.py --additional-retrieval ARCHIVE=INDEX` now supports
+multiple compatible retrieval corpora. `MultiHistoricalRetriever` merges and
+deduplicates SEC/news hits while sharing one embedding model. The primary
+source excludes current-event article IDs; additional archives do not, which
+avoids cross-database article-ID collisions.
+
+Validation completed before launch:
+
+- 45 existing SEC/embedding/search/linking/reasoning tests passed;
+- the new SEC bridge integration test confirms a primary+Exhibit 99 accession
+  loads directly into `load_linked_work`; and
+- multi-source retrieval has a rank/deduplication unit test.
+
+## SEC A100 embedding and budgeted distillation update 2026-07-24
+
+The full SEC archive is fetched, cleaned, and chunked:
+
+- 76,590 planned filings and 134,377 selected documents;
+- 121,800 usable documents and 120,243 canonical documents;
+- 652,052 canonical usable chunks.
+
+Local MPS embedding was stopped safely with 5,577 committed vectors. A remote
+NVIDIA A100-SXM4-40GB instance at `ubuntu@144.24.44.222` is embedding the compact
+`sec_embedding_input.sqlite3` payload into
+`~/sec_embedding/sec_embeddings_a100.sqlite3`. The pinned model revision is
+`97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`; observed throughput is about 105
+chunks/s at batch 256. Do not terminate the instance until the complete output
+has been downloaded and verified locally.
+
+Prepared while the GPU runs:
+
+- `sec_features.py`
+  - builds deterministic metadata/text features without realized returns;
+  - stores exact acceptance-time features and 8-K item codes;
+  - aggregates chunk embeddings into normalized accession vectors;
+  - computes issuer novelty only against earlier issuer filings;
+  - creates an importance/diversity-balanced, chronologically stratified
+    DeepSeek pool and a separate 100-event pilot.
+- `deepseek_reasoner.py`
+  - accepts `--selection-file`;
+  - accepts `--max-cost-usd` and stops scheduling new calls after recorded usage
+    reaches the ceiling;
+  - continues to run entity histories chronologically and disables thinking.
+- `sec_distill.py`
+  - fits a multi-output Ridge probe on frozen event embeddings plus
+    deterministic features;
+  - selects regularization on 2023-2024 and reports a held-out 2025+ fidelity
+    test after refitting through 2024;
+  - overlays direct DeepSeek labels where present and predicts the remainder;
+  - exports daily ticker features with exact SEC timestamp semantics. Before
+    close filings trade next session; after-close/non-session filings wait for
+    the following close and trade one session later.
+
+The real deterministic metadata pass is already complete:
+
+- `sec_features.sqlite3`: 69,567 usable accession events and 69,934
+  issuer-events;
+- 17,552 events have importance score at least 5;
+- 40,687 have Exhibit 99 material;
+- 38,906 were accepted at or after 16:00 New York time.
+
+The current DeepSeek budget is at most `$4`. Use a separate pilot database
+because adding earlier events after cached later states would violate
+chronological state. The prompt version can remain the same so pilot labels can
+be included through `sec_distill.py --additional-reasoning`:
+
+1. build vectors/search/events after the A100 output arrives;
+2. generate `sec_deepseek_pilot.csv` and `sec_deepseek_candidates.csv`;
+3. run 100 pilot events into `sec_reasoning_pilot.sqlite3`;
+4. derive the affordable final label count from actual SEC token usage;
+5. run the final selection into fresh `sec_reasoning.sqlite3` with
+   `--max-cost-usd 3.75`;
+6. train/predict/export with `sec_distill.py`;
+7. ablate quant-only, quant+deterministic-SEC, and
+   quant+deterministic-SEC+distilled-LLM.
+
+The new focused tests pass: 18 SEC feature/distillation/event/reasoning tests.
+
+### SEC embedding handoff completion and live reasoning run
+
+The A100 output is now local and verified. The original 4 KiB-page SQLite file
+was losslessly vacuumed remotely to 64 KiB pages, reducing it from 2.6 GiB to
+1.4 GiB. The reconstructed local artifact is
+`sec_embeddings_a100.sqlite3`, SHA-256
+`8ae27208ec8c12959e5470eab68225e79eab1736fd58d4c22cab714015a8e90d`.
+It contains all 652,052 float16 1,024-dimensional vectors, uses the exact pinned
+Qwen revision above, and passes `PRAGMA quick_check`. The remote GPU is no
+longer needed.
+
+`sec_features.py attach-vectors` was rewritten to stream embeddings by
+canonical article instead of sorting roughly 1.4 GiB of vector BLOBs by
+accession. It now reuses canonical embeddings for duplicate documents, assigns
+666,052 event-chunks, and produces vectors for all 69,567/69,567 modeled SEC
+events. Novelty is backward-only against the previous 20 issuer filings.
+
+Final local artifacts:
+
+- `sec_deterministic_trading_features.csv`: 67,014 ticker-session rows;
+- `sec_deterministic_model_features.csv`: 32 `factor__` fields;
+- `sec_deepseek_pilot.csv`: 100 balanced events;
+- `sec_deepseek_candidates.csv`: 4,500 balanced events
+  (2,925 train / 900 validation / 675 test);
+- `sec_search_index`: all 652,052 vectors plus FTS5 keyword search.
+
+Both interactive search and reasoning retrieval now pin the model revision from
+the index manifest. Exact retrieval across all SEC chunks was measured as too
+slow for bulk labeling because the thread-safe retrieval lock serialized the
+API workers. One retrieval-backed assessment remains in
+`sec_reasoning_pilot.sqlite3` as a diagnostic. Bulk labels therefore use the
+distinct prompt version `sec-reasoning-v1-standalone` with `--no-retrieval`;
+the search index remains available for demos and selective cross-examination.
+
+The standalone pilot in `sec_reasoning_pilot_standalone.sqlite3` completed
+100/100 with zero failures, 444,965 input tokens, 58,576 output tokens, and
+estimated cost `$0.0787`. This projected 4,500 labels at about `$3.54`, under
+the total `$4` ceiling. The full 4,501 entity-event run is currently writing to
+`sec_reasoning.sqlite3` with 16 workers and a hard `$3.75` cap. It runs at about
+2.35 events/s. One early response used the unambiguous alias
+`news_impact_signed`; the parser now repairs that spelling and its test passes,
+so retry failures after the main run.
+
+The deterministic-only walk-forward ablation completed. Validation selected
+`factor_scale=0`; all nonzero deterministic SEC scales reduced 2023-2024 IC.
+The frozen scale-zero path then reported global IC `+0.0277` in 2025 and
+`+0.0183` in partial 2026. These are baseline results, not attributable SEC
+lift. Outputs are `sec_deterministic_rank_predictions.csv` and
+`sec_deterministic_rank_2026.joblib`.
+
+### Live post-label state before context compaction
+
+The main standalone DeepSeek run finished at its hard budget boundary:
+
+- `sec_reasoning.sqlite3`: 4,425 successful assessments and four failures;
+- usage: 20,520,560 input tokens and 3,171,386 output tokens;
+- recorded cost: `$3.7609`;
+- 76 of 4,501 selected entity-events remained without assessments.
+
+The four failures were harmless output-schema variants. The parser now repairs
+`news_impact_signed`, `signed_news_impact`, and `new_uncertainty_change`, and
+drops unknown extra assessment metadata only after canonical aliases are
+handled. Required fields remain validated. Future chronological runs also stop
+one entity chain at its first failed event rather than advancing state past a
+gap. Relevant tests pass.
+
+`sec_reasoning_repair_selection.csv` contains the exact 76 missing event IDs.
+Because some events have multiple accepted ticker links, the fresh repair run
+contains 91 entity-events. It is currently running as PID 98054 into
+`sec_reasoning_repairs.sqlite3` with eight workers, `--no-retrieval`, prompt
+`sec-reasoning-v1-standalone`, and a `$0.10` cap. At the last check it had 67
+successful assessments and zero failures. Only one long chronological ticker
+chain remained, so progress was serial and sometimes paused for a 90-second API
+request. Do not launch a duplicate while PID 98054 exists.
+
+After repair completes:
+
+1. inspect its terminal session if available and verify counts/failures;
+2. train the final independent Ridge probes:
+   `python3 sec_distill.py train --features sec_features.sqlite3 --reasoning sec_reasoning.sqlite3 --additional-reasoning sec_reasoning_repairs.sqlite3 --prompt-version sec-reasoning-v1-standalone`;
+3. predict all events with the same main/repair databases;
+4. export daily features using `spy_price_history_through_2026.csv`;
+5. merge deterministic + distilled features;
+6. run the apples-to-apples 20-session ablations on top of the older structured
+   SEC model.
+
+The distiller is now artifact format 2: it selects Ridge alpha independently
+for each of the 20 learned targets, trains count targets in `log1p` space, and
+uses the expanded alpha grid `0.1,1,10,100,1000,10000`. Four remaining daily
+fields are derived deterministically. Pilot-only training validated the entire
+post-label path.
+
+Search fixes completed while labeling ran:
+
+- query/reasoning model loads pin the exact embedding revision;
+- lexical matching now uses conjunctive terms rather than broad `OR`;
+- hit hydration avoids scanning duplicate full-text rows when effective dates
+  are already materialized.
+
+The benchmark SEC keyword query fell from about 27 seconds to 0.067 seconds
+plus 0.005 seconds hydration. Exact semantic scan remains about 2.8 seconds for
+652,052 chunks, which is suitable for selective/demo retrieval but not bulk
+label production.
+
+The earlier `+0.0895` 2023 daily IC came from a different experiment:
+a 20-session model with dense structured XBRL fundamentals and Form 4 insider
+features. Its 2023 quant-only-like candidate was already about `+0.0865`; the
+structured fundamental block added roughly `+0.003`. The new deterministic
+full-text test used a five-session horizon and only 4.7% row coverage, so its
+negative result is not an apples-to-apples contradiction. The next fair test
+adds deterministic and then distilled full-text SEC features to the old
+20-session structured-SEC configuration, with exact-zero scales selected only
+on 2023-2024.

@@ -520,7 +520,10 @@ def reject_domain_fallback_pages(db: sqlite3.Connection) -> int:
     return rejected
 
 
-def clean_corpus(db: sqlite3.Connection) -> None:
+def clean_corpus(
+    db: sqlite3.Connection,
+    reject_repeated_domain_fallback: bool = True,
+) -> None:
     learned = learn_boilerplate(db)
     rows = db.execute(
         "SELECT id,domain,COALESCE(title_raw,title),article_text_raw FROM articles "
@@ -558,9 +561,10 @@ def clean_corpus(db: sqlite3.Connection) -> None:
         if completed % 1_000 == 0:
             db.commit()
             print(f"Cleaned {completed:,}/{len(rows):,}", flush=True)
-    fallback_count = reject_domain_fallback_pages(db)
-    if fallback_count:
-        print(f"Rejected {fallback_count:,} repeated domain fallback pages", flush=True)
+    if reject_repeated_domain_fallback:
+        fallback_count = reject_domain_fallback_pages(db)
+        if fallback_count:
+            print(f"Rejected {fallback_count:,} repeated domain fallback pages", flush=True)
     db.commit()
 
 

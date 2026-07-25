@@ -37,7 +37,7 @@ class NewsSearchTests(unittest.TestCase):
     def test_keyword_query_removes_stopwords_and_deduplicates(self):
         self.assertEqual(
             ExactNewsIndex._fts_query("The NVIDIA export export restrictions"),
-            '"nvidia" OR "export" OR "restrictions"',
+            '"nvidia" AND "export" AND "restrictions"',
         )
 
     def test_hydration_includes_duplicate_event_metadata(self):

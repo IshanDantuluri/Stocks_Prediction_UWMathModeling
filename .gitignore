@@ -25,6 +25,8 @@ link_sample.jsonl
 ticker_link_sample.jsonl
 link_all.jsonl
 ticker_link_all.jsonl
+ticker_link_recall_v2.jsonl
+candidate_recall_report.json
 .env
 .env.*
 !.env.example
@@ -34,6 +36,15 @@ point_in_time_data.sqlite3
 point_in_time_data.sqlite3-shm
 point_in_time_data.sqlite3-wal
 point_in_time_raw/
+prospective_news.sqlite3
+prospective_news.sqlite3-shm
+prospective_news.sqlite3-wal
+prospective_news_raw/
+entity_alias_enrichment.csv
+sec_text_archive.sqlite3
+sec_text_archive.sqlite3-shm
+sec_text_archive.sqlite3-wal
+sec_text_raw/
 sec_fundamental_features.csv
 sec_insider_features.csv.gz
 macro_features.csv
@@ -66,3 +77,26 @@ walkforward_models*/
 
 # Per-run portfolio summaries are regenerated from prediction tables.
 portfolio_*_summary.json
+
+# Local databases and transient SQLite sidecars (large, rebuildable artifacts).
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Rebuildable SEC search/embedding indexes and transfer shards.
+sec_search_index/
+sec_embeddings_a100.part-*
+sec_embeddings_a100.*.partial
+
+# Rebuildable SEC model inputs, features, and intermediate exports.
+sec_*_features.csv
+sec_*_features.csv.gz
+sec_*.prevector.csv
+sec_deepseek_candidates.csv
+sec_deepseek_pilot.csv
+sec_trading_features.csv
+
+# Generated experiment summaries and temporary rendering/work files.
+*_summary.json
+*.lock
+tmp/

@@ -3,11 +3,15 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from http.client import IncompleteRead
 from pathlib import Path
+from unittest.mock import patch
 
 from deepseek_linker import (
     DeepSeekClient,
+    DeepSeekError,
     build_system_prompt,
+    default_transport,
     initialize_deepseek,
     load_env_file,
     persist_result,
@@ -53,6 +57,24 @@ def valid_content():
 
 
 class DeepSeekLinkerTests(unittest.TestCase):
+    def test_incomplete_http_read_becomes_retryable_transport_error(self):
+        class BrokenResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                raise IncompleteRead(b"")
+
+        with patch(
+            "deepseek_linker.urllib.request.urlopen",
+            return_value=BrokenResponse(),
+        ):
+            with self.assertRaisesRegex(DeepSeekError, "transport error"):
+                default_transport("https://example.test", {}, b"{}", 1)
+
     def test_validation_rejects_invented_ticker(self):
         value = json.loads(valid_content())
         value["links"][0]["entity_id"] = "AMD"
@@ -153,3 +175,5 @@ class DeepSeekLinkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    DeepSeekError,
+    default_transport,

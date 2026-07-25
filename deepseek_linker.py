@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import http.client
 import json
 import os
 import random
@@ -233,7 +234,12 @@ def default_transport(
         raise DeepSeekError(
             f"DeepSeek HTTP {error.code}: {detail}", error.code
         ) from error
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        http.client.HTTPException,
+    ) as error:
         raise DeepSeekError(f"DeepSeek transport error: {error}") from error
     try:
         return json.loads(raw)

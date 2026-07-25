@@ -1,0 +1,33 @@
+model,year,mean_daily_ic
+"+ deterministic
+filing text",2023,0.07652938656483473
+"+ deterministic
+filing text",2024,-0.00809416992358417
+"+ deterministic
+filing text",2025,0.03738639268944458
+"+ deterministic
+filing text",2026,0.008381549208320597
+"+ deterministic +
+distilled LLM",2023,0.0765209696665695
+"+ deterministic +
+distilled LLM",2024,-0.008093642147626805
+"+ deterministic +
+distilled LLM",2025,0.037388498764172565
+"+ deterministic +
+distilled LLM",2026,0.00839161119918226
+"+ direct
+DeepSeek",2023,0.08932861359379765
+"+ direct
+DeepSeek",2024,0.02581655651780303
+"+ direct
+DeepSeek",2025,0.03400259494825806
+"+ direct
+DeepSeek",2026,0.033216531751090766
+"Quant +
+structured SEC",2023,0.08952604436793901
+"Quant +
+structured SEC",2024,0.025850529296293116
+"Quant +
+structured SEC",2025,0.03395289873741149
+"Quant +
+structured SEC",2026,0.03332496853200848

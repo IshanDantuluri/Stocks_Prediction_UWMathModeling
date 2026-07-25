@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import json
 import os
 import random
@@ -12,7 +13,7 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -38,6 +39,7 @@ from news_reasoning import (
     Event,
     EventAssessment,
     HistoricalRetriever,
+    MultiHistoricalRetriever,
     initialize_memory,
     process_event,
     prompt_payload,
@@ -56,6 +58,30 @@ REASONING_PRICES_PER_MILLION = {
 class LinkedWork:
     event: Event
     entity: Entity
+
+
+class ReasoningBudgetExhausted(RuntimeError):
+    """Raised before another request when the configured API budget is spent."""
+
+
+def load_selected_event_ids(path: Path) -> tuple[str, ...]:
+    """Load ranked event IDs from CSV, JSONL, or one-ID-per-line text."""
+    lines = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"selection file is empty: {path}")
+    if path.suffix.lower() == ".csv":
+        rows = list(csv.DictReader(lines))
+        if not rows or "event_id" not in (rows[0].keys() if rows else ()):
+            raise ValueError("selection CSV must contain an event_id column")
+        values = [str(row["event_id"]).strip() for row in rows]
+    elif path.suffix.lower() in {".jsonl", ".ndjson"}:
+        values = [str(json.loads(line)["event_id"]).strip() for line in lines]
+    else:
+        values = lines
+    selected = tuple(dict.fromkeys(value for value in values if value))
+    if not selected:
+        raise ValueError(f"selection file contains no event IDs: {path}")
+    return selected
 
 
 def _system_prompt() -> str:
@@ -160,10 +186,13 @@ def validate_reasoning_output(content: str) -> AnalysisResult:
     # is supplied. These aliases are unambiguous and preserve the same values.
     aliases = {
         "signed_impact": "news_signed_impact",
+        "news_impact_signed": "news_signed_impact",
+        "signed_news_impact": "news_signed_impact",
         "confidence": "news_confidence",
         "novelty": "news_novelty",
         "persistence": "news_persistence",
         "uncertainty_change": "news_uncertainty_change",
+        "new_uncertainty_change": "news_uncertainty_change",
         "disagreement": "news_disagreement",
     }
     for alias, canonical in aliases.items():
@@ -176,6 +205,9 @@ def validate_reasoning_output(content: str) -> AnalysisResult:
     # This is input-schema metadata, not a judgment. Some responses echo it
     # inside the assessment despite also returning all required values.
     assessment.pop("assessment_contract", None)
+    allowed_fields = {field.name for field in fields(EventAssessment)}
+    for unknown in set(assessment) - allowed_fields:
+        assessment.pop(unknown)
     assessment["category_impacts"] = _complete_impact_map(
         assessment.get("category_impacts"), CATEGORY_FIELDS, "category_impacts"
     )
@@ -205,8 +237,6 @@ def validate_reasoning_output(content: str) -> AnalysisResult:
 class DeepSeekReasoningProvider:
     """Thread-safe, bounded-retry implementation of ReasoningProvider."""
 
-    prompt_version = PROMPT_VERSION
-
     def __init__(
         self,
         api_key: str,
@@ -219,13 +249,21 @@ class DeepSeekReasoningProvider:
             [str, dict[str, str], bytes, float], dict[str, Any]
         ] = default_transport,
         sleep: Callable[[float], None] = time.sleep,
+        prompt_version: str = PROMPT_VERSION,
+        max_cost_usd: float | None = None,
     ):
         if not api_key:
             raise ValueError("DeepSeek API key is empty")
         if max_tokens <= 0 or timeout <= 0 or max_attempts <= 0:
             raise ValueError("max_tokens, timeout, and max_attempts must be positive")
+        if not prompt_version.strip():
+            raise ValueError("prompt_version cannot be empty")
+        if max_cost_usd is not None and max_cost_usd <= 0:
+            raise ValueError("max_cost_usd must be positive")
         self.api_key = api_key
         self.model_id = model
+        self.prompt_version = prompt_version.strip()
+        self.max_cost_usd = max_cost_usd
         self.base_url = base_url.rstrip("/")
         self.max_tokens = max_tokens
         self.timeout = timeout
@@ -264,6 +302,13 @@ class DeepSeekReasoningProvider:
         ) / 1_000_000
 
     def analyze(self, request: AnalysisRequest) -> AnalysisResult:
+        if (
+            self.max_cost_usd is not None
+            and self.estimated_cost >= self.max_cost_usd
+        ):
+            raise ReasoningBudgetExhausted(
+                f"DeepSeek reasoning budget ${self.max_cost_usd:.4f} reached"
+            )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -318,6 +363,7 @@ def load_linked_work(
     linker_prompt: str = DEFAULT_LINKER_PROMPT,
     scopes: Iterable[str] = ("ticker", "sector", "market"),
     max_links: int | None = None,
+    selected_event_ids: Iterable[str] | None = None,
 ) -> tuple[int, list[LinkedWork]]:
     """Load accepted links as chronologically sortable reasoning work."""
     selected_scopes = tuple(dict.fromkeys(scopes))
@@ -352,6 +398,17 @@ def load_linked_work(
                 ORDER BY ec.event_date,ec.cluster_id,vl.scope,vl.entity_id""",
             (config_id, linker_model, linker_prompt, *selected_scopes),
         ).fetchall()
+        if selected_event_ids is not None:
+            ranked = tuple(dict.fromkeys(selected_event_ids))
+            allowed = set(ranked)
+            rows = [row for row in rows if row[0] in allowed]
+            found = {row[0] for row in rows}
+            missing = [event_id for event_id in ranked if event_id not in found]
+            if missing:
+                raise ValueError(
+                    f"selection contains {len(missing):,} event IDs without accepted "
+                    f"links; first missing ID: {missing[0]}"
+                )
         if max_links is not None:
             if max_links <= 0:
                 raise ValueError("max_links must be positive")
@@ -419,7 +476,7 @@ def load_linked_work(
 class LockedRetriever:
     """Share one embedding model safely across API worker threads."""
 
-    def __init__(self, retriever: HistoricalRetriever):
+    def __init__(self, retriever: HistoricalRetriever | MultiHistoricalRetriever):
         self.retriever = retriever
         self.lock = threading.Lock()
 
@@ -484,6 +541,7 @@ def run_chronological(
     retriever: LockedRetriever | None,
     workers: int,
     progress_every: int = 10,
+    reuse_retrieval_prompt: str | None = None,
 ) -> tuple[int, int, int]:
     """Process entity chains in parallel and each entity strictly by event date."""
     if workers <= 0:
@@ -510,7 +568,13 @@ def run_chronological(
         (item.event.event_id, item.entity.scope, item.entity.entity_id) not in cached
         for item in work
     )
-    state = {"processed": 0, "ok": 0, "cached": len(work) - pending, "failed": 0}
+    state = {
+        "processed": 0,
+        "ok": 0,
+        "cached": len(work) - pending,
+        "failed": 0,
+        "budget_exhausted": False,
+    }
     state_lock = threading.Lock()
     stop_event = threading.Event()
     started = time.monotonic()
@@ -562,7 +626,12 @@ def run_chronological(
                     continue
                 try:
                     changed = process_event(
-                        db, item.event, item.entity, provider, retriever
+                        db,
+                        item.event,
+                        item.entity,
+                        provider,
+                        retriever,
+                        reuse_retrieval_prompt,
                     )
                     if changed:
                         db.execute(
@@ -582,9 +651,23 @@ def run_chronological(
                         update("ok")
                 except Exception as error:
                     db.rollback()
+                    if isinstance(error, ReasoningBudgetExhausted):
+                        with state_lock:
+                            if not state["budget_exhausted"]:
+                                state["budget_exhausted"] = True
+                                print(
+                                    f"{error}; stopping remaining entity chains.",
+                                    flush=True,
+                                )
+                        stop_event.set()
+                        break
                     _record_failure(db, item, provider, error)
                     failures += 1
                     update("failed")
+                    # A later event must not advance this entity's state past a
+                    # missing earlier judgment. Resume the chain on a later run
+                    # after the failed event has been repaired.
+                    break
                     # Later events depend on this state transition. Stop this entity
                     # chain rather than silently processing them from stale state.
                     break
@@ -647,25 +730,71 @@ def main() -> None:
     parser.add_argument("--events-database", type=Path, default=DEFAULT_EVENTS)
     parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
     parser.add_argument("--index", type=Path, default=DEFAULT_INDEX)
+    parser.add_argument(
+        "--additional-retrieval",
+        action="append",
+        default=[],
+        metavar="ARCHIVE=INDEX",
+        help=(
+            "also retrieve from this compatible archive/index pair; may be "
+            "repeated, while the primary --archive/--index source excludes the "
+            "current event's article IDs"
+        ),
+    )
     parser.add_argument("--database", type=Path, default=DEFAULT_MEMORY)
     parser.add_argument("--config-id", type=int)
     parser.add_argument("--linker-model", default=DEFAULT_MODEL)
     parser.add_argument("--linker-prompt", default=DEFAULT_LINKER_PROMPT)
     parser.add_argument("--scopes", default="ticker,sector,market")
     parser.add_argument("--max-links", type=int)
+    parser.add_argument(
+        "--selection-file",
+        type=Path,
+        help="ranked CSV/JSONL/text event IDs to include in this reasoning run",
+    )
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--prompt-version",
+        default=PROMPT_VERSION,
+        help=(
+            "reasoning-state namespace; change this when candidate/event inputs "
+            "change and chronological state must be rebuilt"
+        ),
+    )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=2000)
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument(
+        "--max-cost-usd",
+        type=float,
+        help=(
+            "stop scheduling new API calls after recorded usage reaches this amount; "
+            "allow a safety margin for already in-flight requests"
+        ),
+    )
     parser.add_argument("--no-retrieval", action="store_true")
+    parser.add_argument(
+        "--reuse-retrieval-prompt",
+        help=(
+            "explicitly reuse stored passages for identical entity-events from "
+            "this earlier prompt namespace; missing contexts search normally"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.workers <= 0:
         parser.error("--workers must be positive")
+    if args.max_cost_usd is not None and args.max_cost_usd <= 0:
+        parser.error("--max-cost-usd must be positive")
     scopes = tuple(value.strip() for value in args.scopes.split(",") if value.strip())
+    selected_event_ids = (
+        load_selected_event_ids(args.selection_file)
+        if args.selection_file is not None
+        else None
+    )
     config_id, work = load_linked_work(
         args.events_database,
         args.archive,
@@ -674,6 +803,7 @@ def main() -> None:
         args.linker_prompt,
         scopes,
         args.max_links,
+        selected_event_ids,
     )
     entities = {(item.entity.scope, item.entity.entity_id) for item in work}
     print(
@@ -697,15 +827,30 @@ def main() -> None:
         args.max_tokens,
         args.timeout,
         args.max_attempts,
+        prompt_version=args.prompt_version,
+        max_cost_usd=args.max_cost_usd,
     )
     retriever = None
     if not args.no_retrieval:
+        retrieval_sources = [(args.archive, args.index)]
+        for raw_source in args.additional_retrieval:
+            if "=" not in raw_source:
+                parser.error("--additional-retrieval must use ARCHIVE=INDEX")
+            archive_value, index_value = raw_source.split("=", 1)
+            if not archive_value.strip() or not index_value.strip():
+                parser.error("--additional-retrieval must use ARCHIVE=INDEX")
+            retrieval_sources.append(
+                (Path(archive_value.strip()), Path(index_value.strip()))
+            )
         print(
-            "Historical retrieval enabled; the embedding model loads once on first use.",
+            f"Historical retrieval enabled across {len(retrieval_sources):,} "
+            "source(s); the embedding model loads once on first use.",
             flush=True,
         )
         retriever = LockedRetriever(
-            HistoricalRetriever(args.archive, args.index)
+            MultiHistoricalRetriever(retrieval_sources)
+            if len(retrieval_sources) > 1
+            else HistoricalRetriever(args.archive, args.index)
         )
     print(
         f"Reasoning with {args.model} at up to {args.workers} concurrent entity chains "
@@ -713,7 +858,12 @@ def main() -> None:
         flush=True,
     )
     ok, failed, cached = run_chronological(
-        work, args.database, provider, retriever, args.workers
+        work,
+        args.database,
+        provider,
+        retriever,
+        args.workers,
+        reuse_retrieval_prompt=args.reuse_retrieval_prompt,
     )
     usage = provider.usage
     print(

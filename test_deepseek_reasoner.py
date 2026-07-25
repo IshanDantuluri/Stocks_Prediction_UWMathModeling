@@ -10,7 +10,9 @@ from deepseek_reasoner import (
     DEFAULT_LINKER_PROMPT,
     DeepSeekReasoningProvider,
     LinkedWork,
+    ReasoningBudgetExhausted,
     load_linked_work,
+    load_selected_event_ids,
     run_chronological,
     validate_reasoning_output,
 )
@@ -99,6 +101,14 @@ def api_response(content: str) -> dict:
 
 
 class DeepSeekReasonerTests(unittest.TestCase):
+    def test_provider_supports_versioned_state_namespace(self):
+        provider = DeepSeekReasoningProvider(
+            "secret",
+            transport=lambda *_args: {},
+            prompt_version="news-reasoning-v2-recall",
+        )
+        self.assertEqual(provider.prompt_version, "news-reasoning-v2-recall")
+
     def test_parser_builds_analysis_result_and_preserves_state(self):
         result = validate_reasoning_output(valid_output())
 
@@ -134,8 +144,9 @@ class DeepSeekReasonerTests(unittest.TestCase):
     def test_parser_repairs_unambiguous_field_aliases_and_echoed_contract(self):
         payload = json.loads(valid_output())
         assessment = payload["assessment"]
-        assessment["signed_impact"] = assessment.pop("news_signed_impact")
+        assessment["news_impact_signed"] = assessment.pop("news_signed_impact")
         assessment["assessment_contract"] = {"signed_impact": "[-1,1]"}
+        assessment["chain"] = {"echoed": "metadata"}
 
         result = validate_reasoning_output(json.dumps(payload))
 
@@ -190,6 +201,24 @@ class DeepSeekReasonerTests(unittest.TestCase):
             provider.analyze(sample_request())
         self.assertEqual(calls, [9, 9, 9])
         self.assertEqual(len(sleeps), 2)
+
+    def test_provider_stops_before_next_request_after_budget_is_reached(self):
+        provider = DeepSeekReasoningProvider(
+            "test-key",
+            max_attempts=1,
+            max_cost_usd=0.00002,
+            transport=lambda *_args: api_response(valid_output()),
+        )
+
+        provider.analyze(sample_request())
+        with self.assertRaises(ReasoningBudgetExhausted):
+            provider.analyze(sample_request())
+
+    def test_selection_file_preserves_rank_and_removes_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "selected.csv"
+            path.write_text("event_id,rank\nb,1\na,2\nb,3\n")
+            self.assertEqual(load_selected_event_ids(path), ("b", "a"))
 
     def test_resume_skips_cached_old_event_after_state_has_advanced(self):
         class CountingProvider:
@@ -382,6 +411,12 @@ class DeepSeekReasonerTests(unittest.TestCase):
             _, sample = load_linked_work(
                 events_path, archive_path, config_id=7, max_links=2
             )
+            _, selected = load_linked_work(
+                events_path,
+                archive_path,
+                config_id=7,
+                selected_event_ids=("later", "a"),
+            )
 
         self.assertEqual(config_id, 7)
         self.assertEqual(
@@ -391,6 +426,9 @@ class DeepSeekReasonerTests(unittest.TestCase):
         self.assertEqual(work[0].event.article_ids, (11,))
         self.assertEqual(work[0].event.source_domains, ("a.example",))
         self.assertEqual([item.event.event_id for item in sample], ["a", "later"])
+        self.assertEqual(
+            [item.event.event_id for item in selected], ["a", "later"]
+        )
 
     def test_runner_stops_entity_chain_after_failed_state_transition(self):
         class FailingProvider:

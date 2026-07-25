@@ -21,6 +21,230 @@ python3 news_archive.py --retry-http-errors  # explicitly retry 403/404/410 resp
 
 The generated `historical_news.sqlite3` is intentionally ignored by Git.
 
+### Prospective news and entity coverage
+
+Prospective collection records the exact first retrieval time, retains each raw
+provider response, and never substitutes a provider abstract for full article
+text. Alpha Vantage's market-wide endpoint covers many tickers in one request:
+
+```bash
+# Uses ALPHA_VANTAGE_API_KEY from .env; one API request per invocation.
+python3 prospective_news.py sync-alpha --limit 1000 --hours-back 48
+python3 prospective_news.py status
+
+# Add provider URLs and provenance to the main archive.
+python3 prospective_news.py materialize
+
+# Fetch a bounded newest-first batch, then clean only those prospective bodies.
+python3 news_archive.py --limit 1000 --workers 16 --newest-first --no-clean
+python3 prospective_news.py clean-archive
+```
+
+`available_at` is the first observed retrieval timestamp, not the provider's
+possibly inaccurate publication time. This is deliberately conservative for
+the close-to-next-open trading contract. The commands are idempotent and are
+suitable for cron/launchd; polling hourly stays within a 25-request daily quota.
+
+Entity linking can be expanded from already cached SEC submissions without a
+network request:
+
+```bash
+python3 entity_knowledge.py
+python3 news_events.py import-aliases entity_alias_enrichment.csv
+```
+
+SEC former company names retain their reported historical intervals. Current
+brands, products, subsidiaries, and executives can be supplied as curated CSV
+rows, but must include `valid_from`; undated prospective aliases are rejected
+to prevent present-day knowledge from leaking into historical linking.
+
+### SEC 8-K/6-K and Exhibit 99 text
+
+The SEC text collector uses the already archived point-in-time filing metadata,
+then retrieves primary 8-K/6-K documents and textual Exhibit 99 press releases.
+It retains exact EDGAR acceptance times, raw compressed bytes, hashes, accession
+and exhibit metadata, and uses a separate article-compatible database:
+
+```bash
+# Observable, resumable batch (SEC_USER_AGENT may be set in the environment).
+python3 sec_text_archive.py sync \
+  --since 2015-01-01 \
+  --limit-filings 100 \
+  --max-documents 250 \
+  --requests-per-second 9 \
+  --download-workers 32 \
+  --workers 4 \
+  --retry-failed
+
+python3 sec_text_archive.py process
+
+# Avoid an unnecessary tokenizer metadata lookup when the model is cached.
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  python3 chunk_articles.py --db sec_text_archive.sqlite3
+
+python3 sec_text_archive.py summary
+```
+
+Omit `--limit-filings` to plan the full backfill, but retain
+`--max-documents` to fetch it in bounded batches. The SEC archive deliberately
+disables the news cleaner's repeated-domain fallback rule because identical SEC
+exhibits can be legitimate; all other cleaning, quality, deduplication, timing,
+and chunk eligibility logic is shared. `--workers` controls separate processes
+for GIL-heavy text extraction, compression, and storage preparation. A bounded
+`--download-workers` thread pool keeps SEC requests in flight while that
+processing runs. A single shared limiter still caps all SEC request starts at
+`--requests-per-second` (never configure that above the SEC maximum of 10).
+Progress reports show both completed documents/second and actual SEC request
+starts/second.
+
+After the full fetch, the guarded local continuation can clean, chunk, embed on
+Apple Silicon, build a dedicated hybrid index, construct accession-level events,
+and run a bounded end-to-end reasoning sample:
+
+```bash
+python3 continue_sec_pipeline.py \
+  --wait-pid "$(pgrep -f 'sec_text_archive.py sync' | head -1)" \
+  --workers 8 \
+  --batch-size 8 \
+  --reasoning-sample 100
+```
+
+`sec_events.py` groups the primary filing and selected Exhibit 99 documents by
+accession. It uses the archived CIK/ticker mapping as a deterministic direct
+issuer link and passes a bounded cleaned filing excerpt to the chronological
+reasoner. This avoids paying a separate LLM call merely to rediscover the
+issuer. The SEC reasoning run can retrieve from both `sec_search_index` and the
+existing `news_search_index`; both use the same Qwen embedding model, which is
+loaded only once.
+
+To build or inspect this bridge separately:
+
+```bash
+python3 sec_events.py
+
+python3 deepseek_reasoner.py \
+  --events-database sec_events.sqlite3 \
+  --archive sec_text_archive.sqlite3 \
+  --index sec_search_index \
+  --database sec_reasoning_pilot.sqlite3 \
+  --linker-model sec-metadata-v1 \
+  --linker-prompt sec-issuer-v1 \
+  --scopes ticker \
+  --prompt-version sec-reasoning-pilot-v1 \
+  --additional-retrieval historical_news.sqlite3=news_search_index \
+  --max-links 100 \
+  --workers 8
+```
+
+The budgeted full-text path separates deterministic coverage from scarce LLM
+labels. Build metadata for every usable accession immediately, attach one
+token-weighted normalized event vector after embeddings arrive, and generate a
+ranked but chronologically stratified candidate pool:
+
+```bash
+python3 sec_features.py build-metadata
+
+python3 sec_features.py attach-vectors \
+  --embeddings sec_embeddings_a100.sqlite3
+
+python3 sec_features.py select \
+  --limit 8000 \
+  --pilot-limit 100 \
+  --output sec_deepseek_candidates.csv \
+  --pilot-output sec_deepseek_pilot.csv
+```
+
+Selection never reads realized returns. It balances high-value item codes and
+Exhibit 99 releases with ticker, sector, year, and embedding-novelty coverage.
+Run the 100-event pilot first, then regenerate the selected count from observed
+SEC token cost. `--max-cost-usd` is a safety stop; reserve margin for requests
+already in flight:
+
+```bash
+python3 deepseek_reasoner.py \
+  --events-database sec_events.sqlite3 \
+  --archive sec_text_archive.sqlite3 \
+  --index sec_search_index \
+  --database sec_reasoning_pilot.sqlite3 \
+  --linker-model sec-metadata-v1 \
+  --linker-prompt sec-issuer-v1 \
+  --scopes ticker \
+  --prompt-version sec-reasoning-v1 \
+  --additional-retrieval historical_news.sqlite3=news_search_index \
+  --selection-file sec_deepseek_pilot.csv \
+  --max-cost-usd 0.10 \
+  --workers 8
+```
+
+After the pilot, regenerate `sec_deepseek_candidates.csv` with the affordable
+`--limit`, then use a fresh reasoning database for the final selected run under
+the reserved `$3.75` ceiling:
+
+```bash
+python3 deepseek_reasoner.py \
+  --events-database sec_events.sqlite3 \
+  --archive sec_text_archive.sqlite3 \
+  --index sec_search_index \
+  --database sec_reasoning.sqlite3 \
+  --linker-model sec-metadata-v1 \
+  --linker-prompt sec-issuer-v1 \
+  --scopes ticker \
+  --prompt-version sec-reasoning-v1 \
+  --additional-retrieval historical_news.sqlite3=news_search_index \
+  --selection-file sec_deepseek_candidates.csv \
+  --max-cost-usd 3.75 \
+  --workers 8
+```
+
+Distill its ticker assessments
+through a chronological linear probe, use direct labels where they exist, and
+export the complete event set to the first tradable session after an eligible
+market-close decision:
+
+```bash
+python3 sec_distill.py train \
+  --features sec_features.sqlite3 \
+  --reasoning sec_reasoning.sqlite3 \
+  --additional-reasoning sec_reasoning_pilot.sqlite3
+
+python3 sec_distill.py predict \
+  --features sec_features.sqlite3 \
+  --reasoning sec_reasoning.sqlite3 \
+  --additional-reasoning sec_reasoning_pilot.sqlite3
+
+python3 sec_distill.py export-daily \
+  --calendar spy_price_history_through_2026.csv
+
+python3 sec_distill.py merge-model \
+  --deterministic sec_deterministic_trading_features.csv \
+  --llm sec_trading_features.csv \
+  --output sec_fulltext_model_features.csv
+```
+
+`merge-model` prefixes every field with `factor__`, so the existing
+`rank_ridge_walkforward.py --factor-features` exact-date join can evaluate the
+new block without changing the frozen quantitative feature builder. Build a
+second merged file without `--llm` for the deterministic-only ablation.
+
+For an SEC filing accepted before 16:00 New York time on a market session, the
+canonical close decision trades at the next open. An after-close or non-session
+filing waits for the next market close and therefore trades at the following
+session's open. This is stricter than assigning every filing on calendar date
+`D` to `D+1`.
+
+To stop an older sequential run and finish only the work already in its queue
+with the parallel fetcher, restart it as:
+
+```bash
+python3 sec_text_archive.py sync \
+  --skip-plan \
+  --max-documents 12000 \
+  --requests-per-second 9 \
+  --download-workers 32 \
+  --workers 4 \
+  --retry-failed
+```
+
 ## Point-in-time external data
 
 `point_in_time_data.py` stores raw source objects plus normalized values with an
@@ -509,6 +733,42 @@ sample:
 ```bash
 python3 deepseek_linker.py link_sample.jsonl --workers 8 --retry-failed
 ```
+
+### Candidate-recall second pass
+
+After importing dated SEC aliases or provider-tagged prospective articles, build
+a full old+new candidate set without automatically accepting any ticker:
+
+```bash
+python3 news_candidate_recall.py --persist
+python3 deepseek_linker.py ticker_link_recall_v2.jsonl --dry-run
+python3 deepseek_linker.py \
+  ticker_link_recall_v2.jsonl \
+  --workers 66 \
+  --retry-failed
+```
+
+The recall pass preserves existing candidates, rescans current date-bounded
+aliases, adds known provider ticker tags, and resolves linker-supplied missing
+company names only when the registry match is unique. The linker still makes
+the final materiality decision. Its generated JSONL contains only events whose
+ticker candidate set expanded, but each payload includes the complete merged
+candidate set so rerunning cannot erase old accepted links.
+
+Changing historical candidate coverage changes chronological entity state. Use
+a new reasoning namespace rather than inserting old events into an already
+advanced state:
+
+```bash
+python3 deepseek_reasoner.py \
+  --prompt-version news-reasoning-v2-recall \
+  --reuse-retrieval-prompt news-reasoning-v1 \
+  --workers 100
+```
+
+The original `news-reasoning-v1` assessments remain available as a frozen
+ablation. Existing event provenance is immutable: a later linker summary cannot
+silently rewrite an event that already contributed to a state chain.
 
 ## Walk-forward quantitative evaluation
 

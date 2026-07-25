@@ -1,10 +1,39 @@
 import sqlite3
 import unittest
+from unittest import mock
 
-from embed_chunks import canonical_chunk_query, get_or_create_config, initialize_output
+import numpy as np
+
+from embed_chunks import (
+    canonical_chunk_query,
+    encode_with_backoff,
+    get_or_create_config,
+    initialize_output,
+)
 
 
 class EmbedChunksTests(unittest.TestCase):
+    def test_mps_oom_clears_cache_and_reduces_batch(self):
+        class OneOomModel:
+            def __init__(self):
+                self.calls = 0
+
+            def encode(self, texts, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("MPS backend out of memory")
+                return np.zeros((len(texts), 4), dtype=np.float32)
+
+        rows = [(number, number, str(number), f"text {number}", 2) for number in range(4)]
+        with mock.patch("torch.mps.empty_cache") as empty_cache:
+            encoded, vectors, size = encode_with_backoff(
+                OneOomModel(), rows, batch_size=4, device="mps"
+            )
+        self.assertEqual(size, 2)
+        self.assertEqual(len(encoded), 2)
+        self.assertEqual(vectors.shape, (2, 4))
+        empty_cache.assert_called_once()
+
     def test_config_is_idempotent_and_versioned(self):
         db = sqlite3.connect(":memory:")
         initialize_output(db)

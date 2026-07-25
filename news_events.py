@@ -241,7 +241,9 @@ def import_entities(db: sqlite3.Connection, source: Path) -> tuple[int, int]:
                 ),
             )
             db.execute(
-                "DELETE FROM entity_aliases WHERE entity_id=? AND alias_kind!='override'",
+                """DELETE FROM entity_aliases
+                   WHERE entity_id=? AND alias_kind IN
+                     ('ticker','company','generated_short_name','provided')""",
                 (ticker,),
             )
             aliases: set[tuple[str, str]] = {(ticker, "ticker"), (company, "company")}
@@ -279,7 +281,12 @@ def import_entities(db: sqlite3.Connection, source: Path) -> tuple[int, int]:
 
 
 def import_alias_overrides(db: sqlite3.Connection, source: Path) -> tuple[int, int]:
-    """Import curated, date-bounded aliases without replacing generated aliases."""
+    """Import curated, date-bounded aliases without replacing generated aliases.
+
+    Optional ``alias_kind`` values are preserved.  Current-only knowledge such
+    as a product, brand, subsidiary, or executive must have ``valid_from`` so
+    it cannot silently leak backwards into historical candidate generation.
+    """
     initialize(db)
     imported = skipped = 0
     with source.open(newline="", encoding="utf-8-sig") as handle:
@@ -290,6 +297,7 @@ def import_alias_overrides(db: sqlite3.Connection, source: Path) -> tuple[int, i
         alias_col = _pick_column(reader.fieldnames, "alias", "name")
         from_col = _pick_column(reader.fieldnames, "valid_from", "start_date")
         to_col = _pick_column(reader.fieldnames, "valid_to", "end_date")
+        kind_col = _pick_column(reader.fieldnames, "alias_kind", "kind")
         if not ticker_col or not alias_col:
             raise ValueError("alias CSV requires ticker and alias columns")
         known = {row[0] for row in db.execute("SELECT entity_id FROM entities")}
@@ -297,19 +305,34 @@ def import_alias_overrides(db: sqlite3.Connection, source: Path) -> tuple[int, i
             ticker = row[ticker_col].strip().upper()
             alias = row[alias_col].strip()
             normalized = normalize_alias(alias)
+            kind = (
+                row.get(kind_col, "").strip().casefold().replace(" ", "_")
+                if kind_col
+                else "override"
+            ) or "override"
             if ticker not in known or not normalized:
                 skipped += 1
                 continue
             valid_from = row.get(from_col, "").strip() or None if from_col else None
             valid_to = row.get(to_col, "").strip() or None if to_col else None
+            if kind in {
+                "brand",
+                "product",
+                "subsidiary",
+                "executive",
+                "prospective",
+            } and not valid_from:
+                raise ValueError(
+                    f"{kind} alias {alias!r} for {ticker} requires valid_from"
+                )
             db.execute(
                 """INSERT INTO entity_aliases(
                      entity_id,alias,normalized_alias,alias_kind,valid_from,valid_to
-                   ) VALUES (?,?,?,'override',?,?)
+                   ) VALUES (?,?,?,?,?,?)
                    ON CONFLICT(entity_id,normalized_alias,alias_kind) DO UPDATE SET
                      alias=excluded.alias,valid_from=excluded.valid_from,
                      valid_to=excluded.valid_to""",
-                (ticker, alias, normalized, valid_from, valid_to),
+                (ticker, alias, normalized, kind, valid_from, valid_to),
             )
             imported += 1
     db.commit()
@@ -633,7 +656,19 @@ def candidates_for_text(
             score = 0.92
         else:
             matched = f" {normalized} " in normalized_text
-            score = 1.0 if kind in {"company", "provided"} else 0.96
+            score = {
+                "company": 1.0,
+                "provided": 1.0,
+                "override": 0.98,
+                "sec_legal_name": 0.99,
+                "subsidiary": 0.94,
+                "brand": 0.90,
+                "product": 0.86,
+                "executive": 0.82,
+            }.get(
+                kind,
+                0.99 if kind.startswith("sec_former_name") else 0.90,
+            )
         if not matched:
             continue
         key = ("ticker", ticker)

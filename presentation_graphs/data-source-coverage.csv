@@ -1,0 +1,11 @@
+group,source,unit,count,coverage_pct
+Non-LLM,OHLCV-derived quant,stock-session,1398969,100.0
+Non-LLM,Structured SEC XBRL,stock-session,1363389,97.45669846865799
+Non-LLM,Form 4 insider activity,stock-session,1085757,77.61122655326888
+Non-LLM,Deterministic SEC text,stock-session,66567,4.758289854885991
+LLM analysis,"Historical news
+DeepSeek assessments",entity-event,1712,100.0
+LLM analysis,"SEC filing
+DeepSeek labels",entity-event,4501,6.436068292961935
+LLM analysis,"SEC filing
+distilled predictions",entity-event,65433,93.56393170703807
